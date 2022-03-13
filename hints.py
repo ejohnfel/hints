@@ -31,6 +31,10 @@ from py_helper import CmdLineMode, DebugMode, DbgMsg, Msg, ErrMsg
 # Global Variables and Constants
 #
 
+# Version Info
+VERSION=(0,0,1)
+Version = __version__ = ".".join([ str(x) for x in VERSION ])
+
 # Hint File Location
 HintURL = None
 # Default/Test Hint File
