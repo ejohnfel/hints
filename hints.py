@@ -4,24 +4,20 @@
 # Hints: Interface for hints and notations, a kind of free form quick and dirty defacto documentation
 #
 
-import os, sys, io, re
-import argparse
+import os, sys, io, re, getpass
+import argparse, cmd
 import sqlite3 as sql
 from sqlite3 import Error
 import csv,json
 import copy, uuid
 
-from datetime import datetime,timedelta
-import time
+from datetime import date,datetime,timedelta,time
+import time as tm
 
 # Hmmm... probably not needed
 from contextlib import contextmanager
 
-# Debug Stoof
-import pdb
-
 # Ma stoof
-
 import mysqlite as sql
 
 import py_helper as ph
@@ -32,27 +28,16 @@ from py_helper import CmdLineMode, DebugMode, DbgMsg, Msg, ErrMsg
 #
 
 # Version Info
-VERSION=(0,0,1)
+VERSION=(0,0,2)
 Version = __version__ = ".".join([ str(x) for x in VERSION ])
 
 # Hint File Location
 HintURL = None
 # Default/Test Hint File
-__HintFile__ = "/srv/storage/data/hints.sql3"
+__HintFile__ = "/tmp/hints.sql3"
 
 # Parser
 Parser = None
-# Subcommands
-Subcommands = dict()
-
-# AutoYes Flag
-AutoYes = False
-
-# Exact Flag
-ExactStrings = False
-
-# All Record Flag
-AllRecords = False
 
 #
 # Classes
@@ -66,27 +51,38 @@ class HintEntry:
 	PrimaryTag = None
 	Tags = list()
 	Description = None
+	Timestamp = None
+	User = None
 
 	# Init Instance
-	def __init__(self,primary=None,tags=None,description=None,recordid=None):
+	def __init__(self,primary=None,description=None,tags=None,timestamp=None,user=None,recordid=None,record=None):
 		"""Init Instance"""
 
 		DbgMsg("Exitting HintEntry::__init__")
 
-		if recordid:
-			self.RecordID = recordid
+		if record != None:
+			self.Read(record)
 		else:
-			self.RecordID = uuid.uuid1()
-
-		self.PrimaryTag = primary
-
-		if tags != None:
-			if type(tags) == list:
-				self.Tags = tags
+			if recordid:
+				self.RecordID = recordid
 			else:
-				self.Tags = tags.split(",")
+				self.RecordID = uuid.uuid1()
 
-		self.Description = description
+			self.PrimaryTag = primary
+
+			if tags != None:
+				if type(tags) == list:
+					self.Tags = tags
+				else:
+					self.Tags = tags.split(",")
+
+			self.Description = description
+
+			timestamp = datetime.now() if timestamp == None else timestamp
+
+			self.Timestamp = timestamp
+
+			self.User = getpass.getuser() if user == None else user
 
 		DbgMsg("Exitting HintEntry::__init__")
 
@@ -98,7 +94,7 @@ class HintEntry:
 
 		buffer = ""
 
-		buffer = "{:<24} {}\n{}".format(self.PrimaryTag,self.Description,",".join(self.Tags))
+		buffer = "{:<24} {}\n\t{}\n\t{}\{}".format(self.PrimaryTag,self.Description,",".join(self.Tags),self.Timestamp,self.User)
 
 		if output:
 			Msg(buffer)
@@ -115,7 +111,9 @@ class HintEntry:
 			"RecordID" : self.RecordID,
 			"PrimaryTag" : self.PrimaryTag,
 			"Tags" : self.Tags,
-			"Description" : self.Description
+			"Description" : self.Description,
+			"Timestamp" : self.Timestamp,
+			"User" : self.User
 		}
 
 		return jdoc
@@ -128,25 +126,27 @@ class HintEntry:
 			self.RecordID,
 			self.PrimaryTag,
 			self.Tags,
-			self.Description
+			self.Description,
+			self.Timestamp,
+			self.User
 		]
 
 		return lst
 
 	# Write Record to Open Connection
-	def Write(self):
+	def Write(self,connection=None):
 		"""Write to Open Connection"""
 
-		DbgMsg("Exitting HintEntry::Write")
+		DbgMsg("Entering HintEntry::Write")
 
 		ins = """
-			INSERT INTO hints(recordid,primarytag,tags,description)
-			VALUES(?,?,?,?)
+			INSERT INTO hints(recordid,primarytag,tags,description,added,user)
+			VALUES(?,?,?,?,?,?)
 		"""
 
-		parameters = [ str(self.RecordID), self.PrimaryTag, ",".join(self.Tags), self.Description ]
+		parameters = [ str(self.RecordID), self.PrimaryTag, ",".join(self.Tags), self.Description, self.Timestamp, self.User ]
 
-		result = sql.Insert(ins,parameters)
+		result = sql.Insert(ins,parameters,connection)
 
 		DbgMsg("Exitting HintEntry::Write")
 
@@ -156,30 +156,213 @@ class HintEntry:
 	def Read(self,datum):
 		"""Read Data for Instance From Open Connection"""
 
-		DbgMsg("Exitting HintEntry::Read")
+		DbgMsg("Entering HintEntry::Read")
 
 		self.RecordID = uuid.UUID(datum[0])
 		self.PrimaryTag = datum[1]
 		self.Tags = datum[2].split(",")
 		self.Description = datum[3]
+		self.Timestamp = datum[4]
+		self.User = datum[5]
 
 		DbgMsg("Exitting HintEntry::Read")
 
+	# Update Hint Entry
+	def Update(self,connection=None):
+		"""Update Entry"""
+
+		DbgMsg("Entering HintEntry::Update")
+
+		ins = "UPDATE hints set primary = ?, tags = ?, decription = ? WHERE recordid = ?"
+		params = [ self.PrimaryTag, ",".join(self.Tags), self.Description, str(self.RecordID) ]
+
+		result = sql.Update(ins,params,connection)
+
+		DbgMsg("Exiting HintEntry::Update")
+
+		return result
+
 	# Delte This Instance from Database
-	def Delete(self):
+	def Delete(self,connection=None):
 		"""Delete From Database"""
 
-		DbgMsg("Exitting HintEntry::Delete")
+		DbgMsg("Entering HintEntry::Delete")
 
 		ins = "DELETE FROM hints WHERE recordid = ?"
 
 		parameters = [ str(self.RecordID) ]
 
-		result = sql.Delete(ins,parameters)
+		result = sql.Delete(ins,parameters,connection=connection)
 
 		DbgMsg("Exitting HintEntry::Delete")
 
 		return result
+
+# Hint Shell
+class HintShell(cmd.Cmd):
+	"""Hint Shell"""
+
+	intro = "Welcome to the Hint Shell. Type help or ? to list commands.\n"
+	prompt = "hint > "
+	file = None
+
+	add_parser = None
+
+
+	# Init Parsers
+	def InitParsers(self):
+		"""Init Parsers"""
+
+		if add_parser == None:
+			add_parser = argparser.ArgumentParser(description="Add Hint")
+			add_parser.add_argument("keyword",nargs="?",help="Keyword/Primry Tag, quoted if a phrase")
+			add_parser.add_argument("comment",nargs="?",help="Comment, in quotes")
+			add_parser.add_argument("tags",nargs="?",help="Any other tags, comma separated")
+
+	# Set HintDB
+	def do_hintdb(self,args):
+		"""Get or Set Hint DB URL"""
+
+		global HintURL
+
+		if args in [ None, ""]:
+			Msg(HintURL)
+		else:
+			CloseHintDB()
+
+			HintURL = args
+
+			OpenHintDB()
+
+	# Add Hint Entry
+	def do_add(self,args):
+		"""Add Hint Entry"""
+
+		self.InitParsers()
+
+		arguments = ph.ParseDelimitedString(args)
+
+		args,unknowns = self.add_parser.parse_args(arguments)
+
+		he = HintEntry(args.keyword,args.comment,args.tags)
+
+		he.Write()
+
+	# Bulk Add
+	def do_bulkadd(self,args):
+		"""Bulk Add"""
+
+		BulkAdd(args)
+
+	# Remove Hint
+	def do_rm(self,args):
+		"""Remove Hint"""
+
+		Delete(args)
+
+	# Bulk Remove
+	def do_bulkrm(self,args):
+		"""Bulk remove"""
+
+		BulkDelete(args)
+
+	# Edit Entry
+	def do_edit(self,args):
+		"""Edit Single Hint Entry"""
+
+		# args should be uuid
+		hes = Search(args)
+
+		if hes and len(hes) > 0:
+			he = hes[0]
+
+			buffer = f"{he.PrimaryTag}\n{he.Description}\n{he.Tags}"
+
+			EditBuffer(buffer)
+
+			fields = buffer.split("\n")
+
+			he.PrimaryTag = fields[0]
+			he.Description = fields[1]
+			he.Tags = fields[2]
+
+			he.Update()
+
+	# Info
+	def do_info(self,args):
+		"""Info About Hint Database"""
+
+		HintFileInfo()
+
+	# Dump
+	def do_dump(self,args):
+		"""Dump hint database"""
+
+		results = Dump()
+
+		output = True
+		f_out = None
+
+		if not args in [ None, "" ]:
+			output = False
+			f_out = open(args,"w")
+
+		for result in results:
+			buffer = result.Print(output)
+
+			if not output:
+				f_out.write(buffer + "\n")
+
+		if f_out: close(f_out)
+
+	# Search
+	def do_search(self,args):
+		"""Search Hint Database"""
+
+		results = Search(args)
+
+		for result in results:
+			result.Print()
+
+	# Quit Shell
+	def do_quit(self,args):
+		"""Quit Shell"""
+		return True
+
+#
+# Functions
+#
+
+# Edit Buffer (added to py_helper 2/24/2022, can remove this at some point)
+def EditBuffer(buffer,prompt=False):
+	"""
+	Edit a string buffer in an external editor
+
+	If input buffer/string remains unchanged, None is returned
+	"""
+
+	tmp = ph.TmpFilename()
+	new_buffer = ""
+
+	with open(tmp,"w") as f_out:
+		f_out.write(buffer)
+
+	ph.Edit(tmp)
+
+	with open(tmp,"r") as f_in:
+		new_buffer = f_in.read()
+
+	os.remove(tmp)
+
+	response = "y"
+
+	if prompt:
+		response = input("Keep (y/n)? ")
+
+	if buffer == new_buffer or response.lower() == "n":
+		new_buffer = None
+
+	return new_buffer
 
 # Open DB
 def OpenHintDB(url=None):
@@ -187,7 +370,7 @@ def OpenHintDB(url=None):
 
 	DbgMsg("Entering hints::OpenHintDB")
 
-	global HintURL
+	global HintURL, CurrentConnection
 
 	conn = None
 
@@ -197,7 +380,9 @@ def OpenHintDB(url=None):
 		recordid VARCHAR(36),
 		primarytag VARCHAR(64),
 		tags VARCHAR(924),
-		description VARCHAR(1024)
+		description VARCHAR(1024),
+		added timestamp,
+		user VARCHAR(32)
 	);"""
 
 	table_specs = [ hint_table ]
@@ -207,6 +392,7 @@ def OpenHintDB(url=None):
 
 	try:
 		conn = sql.Open(url,table_specs)
+		CurrentConnection = conn
 	except Error as dberr:
 		ErrMsg(dberr,f"An error occurred trying to open {url}")
 	except Exception as err:
@@ -216,8 +402,17 @@ def OpenHintDB(url=None):
 
 	return conn
 
+# Close Hint DB
+def CloseHintDB(connection=None):
+	"""Close current Connection"""
+
+	if connection != None:
+		connection.close()
+	else:
+		sql.Close(sql.ActiveConnection)
+
 # Get Stats On Hint File
-def HintFileInfo(output=True,**kwargs):
+def HintFileInfo(output=True):
 	"""Get Hint File Data"""
 
 	global HintURL
@@ -230,7 +425,7 @@ def HintFileInfo(output=True,**kwargs):
 	try:
 		buffer += "{:<20} : {}\n".format("File Size",os.path.getsize(HintURL))
 
-		recs = Dump(None,noshow=True)
+		recs = Dump()
 		count = len(recs)
 	except Exception as err:
 		accessible = False;
@@ -243,51 +438,24 @@ def HintFileInfo(output=True,**kwargs):
 
 	return buffer
 
-# Ask user for Entry
-def AskForEntry(allow_quit=False,**kwargs):
-	"""Ask User for Entry"""
-
-	DbgMsg("Entering hints::AskForEntry")
-
-	primarytag = input("Primary Tag : ")
-
-	if allow_quit and primarytag == "quit": return None
-
-	description = input("Description : ")
-
-	if allow_quit and description == "quit": return None
-
-	tags = input("Tags (CSL) : ")
-
-	if allow_quit and tags == "quit": return None
-
-	he = HintEntry(primarytag,tags,description)
-
-	DbgMsg("Exitting hint::AskForEntry")
-
-	return he
-
 # Add Hint
-def Add(args,**kwargs):
+def Add(keyword,description,tags,timestamp=None,user=None,connection=None):
 	"""Add Hint"""
+
+	global CurrentConnection
 
 	DbgMsg("Entering hints::Add")
 
-	he = None
+	he = HintEntry(keyword,description,tags,timestamp=timestamp,user=user)
 
-	if len(args) > 0:
-		he = HintEntry(args[0],args[1],args[2])
-	else:
-		he = AskForEntry(True)
-
-	if he: he.Write()
+	he.Write(connection)
 
 	DbgMsg("Exitting hint::Add")
 
 	return he
 
 # Bulk Adds
-def BulkAdd(args,**kwargs):
+def BulkAdd(filename,connection=None):
 	"""Bulk Adds"""
 
 	DbgMsg("Entering hints::BulkAdd")
@@ -296,114 +464,105 @@ def BulkAdd(args,**kwargs):
 
 	hes = list()
 
-	if len(args) > 0:
-		for arg in args:
-			he = HintEntry(arg[0],arg[1],arg[2])
+	if os.path.exists(filename):
+		with open(filename,"r",newline='') as tsvfile:
+			reader = csv.reader(tsvfile,delimiter="\t")
 
-			he.Write()
+			for row in reader:
+				he = HintEntry(row[0],row[1],row[2])
 
-			hes.append(he)
-	else:
-		flag = True
+				he.write(connection)
 
-		Msg("Type 'quit' when done")
-
-		while flag:
-			he = AskForEntry(True)
-
-			if he:
-				he.Write()
 				hes.append(he)
-			else:
-				flag = False
 
 	DbgMsg("Exitting hint::BulkAdd")
 
 	return hes
 
 # Delete Hint(s)
-def Delete(args,**kwargs):
+def Delete(record_id,connection=None):
 	"""Delete Hints from DB"""
 
 	DbgMsg("Entering hints::Delete")
 
-	cmd = "DELETE FROM hints where recordid = ?"
+	he = HintEntry(recordid=record_id)
 
-	result = None
-
-	for arg in args:
-		parameters = [ arg ]
-
-		result = sql.Delete(cmd,parameters)
+	result = he.Delete(connection)
 
 	DbgMsg("Exitting hint::Delete")
 
 	return result
 
+# Bulk Delete
+def BulkDelete(filename,connection=None):
+	"""Bulk Delete"""
+
+	success = False
+
+	if os.path.exists(filename):
+		with open(filename,"r") as f_in:
+			for line in f_in:
+				result = Delete(line,connection)
+
+		success = True
+
+	return success
+
 # Dump Hint DB
-def Dump(args,**kwargs):
+def Dump(connection=None):
 	"""Dump Database"""
 
 	DbgMsg("Entering hints::Dump")
 
-	noshow = kwargs.get("noshow",False)
+	rows = sql.Select("SELECT * FROM hints",connection=connection)
 
-	rows = sql.Select("SELECT * FROM hints")
+	records = list()
 
 	for row in rows:
-		he = HintEntry()
+		he = HintEntry(record=row)
 
-		he.Read(row)
+		records.append(he)
 
-		if not noshow:
-			Msg(f"{he.PrimaryTag}, {he.Description}, {he.Tags}, {he.RecordID}")
+		Msg(f"{he.PrimaryTag}, {he.Description}, {he.Tags}, {he.RecordID}")
 
 	DbgMsg("Exitting hint::Dump")
 
-	return rows
+	return records
 
 # Search Hint DB
-def Search(args,**kwargs):
+def Search(pattern,all=False,exact=False,connection=None):
 	"""Search Hint File"""
 
 	DbgMsg("Entering hints::Search")
 
 	cmd = None
 	records = list()
-	noshow = kwargs.get("noshow",False)
-	exact = kwargs.get("exact",False)
-	all = kwargs.get("all",False)
 
 	if not all:
-		for arg in args:
-			parameters = [ arg, arg, arg ]
+		parameters = [ pattern, pattern, pattern ]
 
-			if exact:
-				cmd = "SELECT * FROM hints where primarytag = ? or description = ? or tags = ?"
-			else:
-				cmd = "SELECT * FROM hints where primarytag like ? or description like ? or tags like ?"
+		if exact:
+			cmd = "SELECT * FROM hints where primarytag = ? or description = ? or tags = ?"
+		else:
+			cmd = "SELECT * FROM hints where primarytag like ? or description like ? or tags like ?"
 
-			results = sql.Select(cmd,parameters)
+		results = sql.Select(cmd,parameters,connection)
 
-			for result in results:
-				records.append(result)
+		for result in results:
+			records.append(result)
 	else:
 		cmd = "SELECT * FROM hints"
 
-		results = sql.Select(cmd)
+		results = sql.Select(cmd,connection)
 
 		for arg in args:
-			exp = re.compile(arg)
+			exp = re.compile(pattern)
 
 			for row in results:
 				flag = (exp.search(row[1]) or exp.search(row[2]) or exp.search(row[3]))
 
 				if flag:
 					records.append(row)
-
-	if not noshow:
-		for record in record:
-			Msg(f"{record[0]}, {record[2]}, {record[3]}")
 
 	DbgMsg("Exitting hint::Search")
 
@@ -420,6 +579,74 @@ def SetHintFile(fname=None):
 	else:
 		HintURL = __HintFile__
 
+# Build Parser
+def BuildParser():
+	"""Build Parser"""
+
+	global Parser
+
+	Parser = parser = argparse.ArgumentParser(prog="Hints App",description="Hints App")
+
+	parser.add_argument("-d","--debug",action="store_true",help="Enter debug mode")
+	parser.add_argument("--hint",help="Hint DB Url")
+
+	subparsers = parser.add_subparsers(help="Sub commands",dest="operation")
+
+	# Test Mode
+	test_sp = subparsers.add_parser("test",help="Enter Test Mode")
+
+	# Shell Mode
+	shell_sp = subparsers.add_parser("shell",help="Enter Shell Mode")
+
+	# Shell Mode
+	dump_sp = subparsers.add_parser("dump",help="Dump hint database")
+
+	# Add Cmd
+	add_sp = subparsers.add_parser("add",help="Add hint")
+	add_sp.add_argument("keyword",nargs=1,help="Keyword/primary tag of hint")
+	add_sp.add_argument("description",nargs=1,help="Description of hint")
+	add_sp.add_argument("tags",nargs="?",help="Any extra tags")
+
+	# Bulk Add
+	bulkadd_sp = subparsers.add_parser("bulkadd",help="Bulk add")
+	bulkadd_sp.add_argument("filename",help="Filename with bulk data")
+
+	# Delete One Cmd
+	del_ap = subparsers.add_parser("rm",help="Remove hint")
+	del_ap.add_argument("recordid",default=None,help="Hint to delete")
+
+	# Bulk Delete Cmd
+	bulkdel_ap = subparsers.add_parser("bulkrm",help="Bulk Remove")
+	bulkdel_ap.add_argument("filename",help="Filenme with bulk data")
+
+	# Search Cmd
+	search_sp = subparsers.add_parser("search",help="Search hint database")
+	search_sp.add_argument("-e","--exact",action="store_true",help="Exact tring search")
+	search_sp.add_argument("--all",action="store_true",help="Return/Search all entries")
+	search_sp.add_argument("pattern",help="Pattern to search for, can be regular expression if --all is enabled")
+
+# Parse Args
+def ParseArgs(arguments=None):
+	"""Parse Args"""
+
+	DbgMsg("Entering hints::ParseArgs")
+
+	args = unknowns = None
+
+	if arguments != None:
+		args,unknowns = Parser.parse_known_args(arguments)
+	else:
+		args,unknowns = Parser.parse_known_args()
+
+	if args.debug: DebugMode(True)
+
+	if args.hint:
+		SetHintFile(args.hint)
+
+	DbgMsg("Exitting hint::ParseArgs")
+
+	return args,unknowns
+
 #
 # Initialize Module
 #
@@ -428,30 +655,66 @@ def Initialize():
 
 	DbgMsg("Entering hints::Initialize")
 
-	global Parser, Subcommands
-
 	SetHintFile()
 
-	Subcommands["add"] = Add
-	Subcommands["bulk"] = BulkAdd
-	Subcommands["del"] = Delete
-	Subcommands["dump"] = Dump
-	Subcommands["search"] = Search
-	Subcommands["info"] = HintFileInfo
-
-	choices = [ key for key in Subcommands.keys() ]
-
-	Parser = parser = argparse.ArgumentParser(prog="Hints App",description="Hints App")
-
-	parser.add_argument("--test",action="store_true",help="Enter test mode")
-	parser.add_argument("-d","--debug",action="store_true",help="Enter debug mode")
-	parser.add_argument("-e","--exact",action="store_true",help="Exact string search")
-	parser.add_argument("--all",action="store_true",help="Return/Search all entries")
-	parser.add_argument("-y","--yes",action="store_true",help="Always yes")
-	parser.add_argument("--hint",help="Hint DB Url")
-	parser.add_argument("cmd",choices=choices,nargs=1,help="Command")
+	BuildParser()
 
 	DbgMsg("Exitting hint::Initialize")
+
+# Run pattern handler
+def run(**kwargs):
+	"""Run/plugin pattern handler"""
+
+	arguments = kwargs.get("arguments",None)
+	args = kwargs.get("args",None)
+	results = None
+
+	if arguments:
+		args,unknowns = ParseArgs(arguments)
+	elif args == None:
+		args,unknowns = ParseArgs()
+
+	try:
+		OpenHintDB()
+	except Exception as err:
+		ErrMsg(err,"A problem occurred trying to open the hint database")
+
+		return results
+
+	try:
+		op = args.operation
+
+		if op == "test" and CmdLineMode():
+			test()
+		elif op == "shell":
+			HintShell().cmdloop()
+		elif op == "add":
+			result = Add(args.keyword,args.decription,args.tags)
+		elif op == "bulkadd":
+			result = BulkAdd(args.filename)
+		elif op == "rm":
+			result = Delete(args.recordid)
+		elif op == "bulkrm":
+			result = BulkDelete(args.filenme)
+		elif op == "search":
+			results = Search(args.pattern,args.all,args.exact)
+
+			if CmdLineMode():
+				for result in results:
+					result.Print()
+		elif op == "dump":
+			result = Dump()
+
+	except Exception as err:
+		ErrMsg(err,f"An error occurred trying operation on hint database - {cmd}")
+	finally:
+		CloseHintDB()
+
+	return results
+
+#
+# Test Scaffolding
+#
 
 # Test Scaffolding
 def Test():
@@ -462,33 +725,6 @@ def Test():
 	Msg("Does nothing ATM")
 
 	Msg("Exitting Test Scaffolding")
-
-# Parse Args
-def ParseArgs():
-	"""Parse Args"""
-
-	DbgMsg("Entering hints::ParseArgs")
-
-	global AutoYes, ExactStrings, HintURL
-
-	args, unknowns = Parser.parse_known_args()
-
-	AutoYes = args.yes
-	ExactStrings = args.exact
-	AllRecords = args.all
-
-	if args.debug:
-		DebugMode(True)
-		DbgMsg("Debug mode turned on")
-
-	if args.hint: SetHintFile(args.hint) # Can Directly set HintURL too
-
-	if args.test:
-		Test()
-
-	DbgMsg("Exitting hint::ParseArgs")
-
-	return args,unknowns
 
 #
 # Internal Init
@@ -501,28 +737,7 @@ Initialize()
 #
 
 if __name__ == "__main__":
-	# Parse Args
-	args,unknowns = ParseArgs()
-
+	# Setup CommandLine Mode
 	CmdLineMode(True)
 
-	OpenHintDB()
-
-	subcmds = [ cmd for cmd in Subcommands.keys() ]
-
-	cmd = ""
-
-	if len(args.cmd) > 0:
-		cmd = args.cmd[0]
-
-	results = None
-
-	if cmd in subcmds:
-		f = Subcommands[cmd]
-
-		if cmd == "info":
-			results = f()
-		else:
-			results = f(unknowns,noshow=False,exact=ExactStrings,all=AllRecords)
-	else:
-		Msg(f"'{args.cmd}' is not recognized")
+	run()
